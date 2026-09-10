@@ -1,9 +1,26 @@
 name: windows-build
 
-# ASP-maintenance addition: allow triggering a build by hand on any branch.
+# ---------------------------------------------------------------------------
+# ASP-maintenance additions (see the ASP-maintenance block at the end of the
+# job for the packaging half). Original upstream build steps are unchanged.
+#
+#   1. workflow_dispatch            -- build by hand on any branch.
+#   2. MODULE_REF / CTYPE / RTYPE   -- explicit build inputs (see below).
+#   3. diagnostic + collect + verify + upload steps after Build.
+# ---------------------------------------------------------------------------
 on:
   workflow_dispatch:
     inputs:
+      module_ref:
+        description: 'mod-playerbots ref (empty = master). Only set this to test-staging when explicitly testing new features.'
+        required: false
+        default: ''
+        type: string
+      build_type:
+        description: 'CTYPE passed to acore.sh (Release | RelWithDebInfo | Debug)'
+        required: false
+        default: 'Release'
+        type: string
       retention_days:
         description: 'Artifact retention in days'
         required: false
@@ -36,15 +53,29 @@ jobs:
     name: ${{ matrix.os }}
     env:
       BOOST_ROOT: C:\local\boost_1_87_0
+      # ASP-maintenance: the module ref must NOT silently follow test-staging.
+      # Upstream derived it from the core branch, which turned any non-Playerbot
+      # branch into test-staging. This project tracks the stable mod-playerbots
+      # master by default; test-staging is opt-in via the module_ref input.
+      MODULE_REF: ${{ inputs.module_ref != '' && inputs.module_ref || 'master' }}
+      # ASP-maintenance: conf/dist/config.sh does CTYPE=${CTYPE:-Release}, so the
+      # default build type is Release, NOT RelWithDebInfo. Set it explicitly so the
+      # build, the runtime output folder and the provenance string cannot disagree.
+      CTYPE: ${{ inputs.build_type != '' && inputs.build_type || 'Release' }}
+      # Runtime output folder name. For single-config generators it equals CTYPE;
+      # set RTYPE if a generator ever disagrees.
+      RTYPE: ${{ inputs.build_type != '' && inputs.build_type || 'Release' }}
     steps:
       - name: Checkout AzerothCore
+        id: core
         uses: actions/checkout@v7
 
       - name: Checkout Playerbot Module
+        id: module
         uses: actions/checkout@v7
         with:
           repository: mod-playerbots/mod-playerbots
-          ref: ${{ github.ref_name == 'Playerbot' && 'master' || 'test-staging' }}
+          ref: ${{ env.MODULE_REF }}
           path: modules/mod-playerbots
 
       - name: ccache
@@ -157,10 +188,13 @@ jobs:
           export CTOOLS_BUILD=all
           ./acore.sh compiler build
 
-      # --- ASP-maintenance additions -------------------------------------------
-      # The upstream workflow ended at the build, so the compiled server was
-      # destroyed with the runner. Record what was produced, prove both server
-      # binaries exist, then publish them as a downloadable artifact.
+      # ==========================================================================
+      # ASP-maintenance block: diagnostic, collect runtime, verify, upload.
+      # Replaces an earlier version that guessed fixed output paths; the paths are
+      # now derived from conf/dist/config.sh (BINPATH=env/dist, BUILDPATH=var/build/obj)
+      # and confirmed by a bounded recursive search.
+      # ==========================================================================
+
       - name: Record provenance
         if: always()
         shell: pwsh
@@ -172,20 +206,30 @@ jobs:
           $modDate  = (git -C modules/mod-playerbots log -1 --format=%cI)
           $modSubj  = (git -C modules/mod-playerbots log -1 --format=%s)
           $lines = @(
-            "generated_utc      = $(Get-Date -AsUTC -Format o)"
-            "core_repository    = ${{ github.repository }}"
-            "core_ref           = ${{ github.ref_name }}"
-            "core_commit        = $coreSha"
-            "core_commit_date   = $coreDate"
-            "core_subject       = $coreSubj"
-            "module_repository  = mod-playerbots/mod-playerbots"
-            "module_commit      = $modSha"
-            "module_commit_date = $modDate"
-            "module_subject     = $modSubj"
-            "runner_os          = ${{ runner.os }}"
-            "build_type         = RelWithDebInfo"
-            "trigger            = ${{ github.event_name }}"
+            "generated_utc        = $(Get-Date -AsUTC -Format o)"
+            "core_repository      = ${{ github.repository }}"
+            "core_branch          = ${{ github.ref_name }}"
+            "core_commit          = $coreSha"
+            "core_commit_date     = $coreDate"
+            "core_subject         = $coreSubj"
+            "module_repository    = mod-playerbots/mod-playerbots"
+            "module_ref           = $env:MODULE_REF"
+            "module_commit        = $modSha"
+            "module_commit_date   = $modDate"
+            "module_subject       = $modSubj"
+            "build_type           = $env:CTYPE"
+            "install_prefix       = env/dist"
+            "build_dir            = var/build/obj"
+            "runner_os            = ${{ runner.os }}"
+            "trigger              = ${{ github.event_name }}"
+            "github_run_id        = ${{ github.run_id }}"
+            "github_run_number    = ${{ github.run_number }}"
           )
+          $coreShort = $coreSha.Substring(0, 7)
+          $modShort  = $modSha.Substring(0, 7)
+          $artifactName = "asp-server-win64-$coreShort-$modShort"
+          Add-Content -Path $env:GITHUB_ENV -Value "ARTIFACT_NAME=$artifactName" -Encoding utf8
+          $lines += "artifact_name        = $artifactName"
           $lines | Out-File -FilePath build-provenance.txt -Encoding utf8
           $lines | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
           Get-Content build-provenance.txt
@@ -194,7 +238,24 @@ jobs:
         if: always()
         shell: pwsh
         run: |
-          foreach ($d in @('env/dist', 'env/dist/bin', 'env/dist/etc', 'build/bin', 'build/bin/RelWithDebInfo')) {
+          # Every path that could plausibly hold the freshly built server, per
+          # conf/dist/config.sh plus the CMake generator's own output convention.
+          $dirs = @(
+            'var/build/obj',
+            'var/build/obj/bin',
+            ('var/build/obj/bin/' + $env:RTYPE),
+            ('var/build/obj/' + $env:RTYPE),
+            'var/build/obj/bin/Release',
+            'var/build/obj/bin/RelWithDebInfo',
+            'env/dist',
+            'env/dist/bin',
+            'env/dist/etc',
+            'build',
+            'build/bin',
+            'build/bin/Release',
+            'build/bin/RelWithDebInfo'
+          )
+          foreach ($d in $dirs) {
             Write-Host "==== $d ===="
             if (Test-Path $d) {
               Get-ChildItem $d -Force |
@@ -207,39 +268,144 @@ jobs:
             }
           }
 
+      - name: Locate built server binaries
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          # 1) expected locations first, in priority order
+          $expected = @(
+            ('env/dist/bin/worldserver.exe'),
+            ('var/build/obj/bin/' + $env:RTYPE + '/worldserver.exe'),
+            ('var/build/obj/' + $env:RTYPE + '/worldserver.exe'),
+            ('build/bin/' + $env:RTYPE + '/worldserver.exe'),
+            ('build/worldserver.exe')
+          )
+          Write-Host '--- expected candidates ---'
+          foreach ($c in $expected) { Write-Host ("{0,-62} {1}" -f $c, (Test-Path $c)) }
+
+          # 2) bounded recursive search as ground truth.
+          #    var/build/obj is the CMake build tree and contains no VCS data, so a
+          #    recursive walk there is cheap and safe.
+          Write-Host ''
+          Write-Host '--- recursive search ---'
+          $found = @()
+          foreach ($root in @('var/build/obj', 'env/dist', 'build')) {
+            if (Test-Path $root) {
+              $hits = Get-ChildItem $root -Recurse -Force -File -ErrorAction SilentlyContinue -Include 'worldserver.exe','authserver.exe'
+              foreach ($h in $hits) {
+                Write-Host ("FOUND {0}  ({1} bytes)" -f $h.FullName, $h.Length)
+                $found += $h
+              }
+            } else {
+              Write-Host "skip (missing): $root"
+            }
+          }
+          if ($found.Count -eq 0) { throw 'No worldserver.exe/authserver.exe found under var/build/obj, env/dist or build.' }
+
+          # 3) pick the worldserver/authserver pair, preferring env/dist/bin
+          $ws = $found |
+                Where-Object { $_.Name -eq 'worldserver.exe' } |
+                Sort-Object { if ($_.FullName -match 'env/dist/bin') { 0 } else { 1 } }, Length -Descending |
+                Select-Object -First 1
+          $as = $found |
+                Where-Object { $_.Name -eq 'authserver.exe' } |
+                Sort-Object { if ($_.FullName -match 'env/dist/bin') { 0 } else { 1 } }, Length -Descending |
+                Select-Object -First 1
+          if (-not $ws) { throw 'authserver.exe found but worldserver.exe was not.' }
+          if (-not $as) { throw 'worldserver.exe found but authserver.exe was not.' }
+
+          Write-Host ''
+          Write-Host ("SELECTED worldserver.exe -> {0}" -f $ws.FullName)
+          Write-Host ("SELECTED authserver.exe  -> {0}" -f $as.FullName)
+
+          # 4) publish for later steps
+          $env:WS_PATH = $ws.FullName
+          $env:AS_PATH = $as.FullName
+          Add-Content -Path $env:GITHUB_ENV -Value "WS_PATH=$($ws.FullName)" -Encoding utf8
+          Add-Content -Path $env:GITHUB_ENV -Value "AS_PATH=$($as.FullName)" -Encoding utf8
+          Add-Content -Path $env:GITHUB_ENV -Value "WS_DIR=$($ws.DirectoryName)" -Encoding utf8
+
+      - name: Collect runtime tree
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $stage = Join-Path $env:RUNNER_TEMP 'asp-server'
+          if (Test-Path $stage) { Remove-Item -Recurse -Force $stage }
+          $binDir = Join-Path $stage 'bin'
+          $etcDir = Join-Path $stage 'etc'
+          New-Item -ItemType Directory -Force -Path $binDir, $etcDir | Out-Null
+
+          # 1) the two servers
+          Copy-Item $env:WS_PATH -Destination $binDir -Force
+          Copy-Item $env:AS_PATH -Destination $binDir -Force
+
+          # 2) every DLL that sits next to the built worldserver. Upstream links
+          #    MySQL and OpenSSL dynamically on Windows, so these are runtime
+          #    requirements, not build leftovers.
+          $dlls = Get-ChildItem $env:WS_DIR -Force -File -Filter '*.dll' -ErrorAction SilentlyContinue
+          if ($dlls) {
+            foreach ($d in $dlls) {
+              Copy-Item $d.FullName -Destination $binDir -Force
+              Write-Host ("copied dll: {0}" -f $d.Name)
+            }
+          } else {
+            Write-Host 'WARNING: no DLLs found next to worldserver.exe. The server may still need libmysql.dll and the OpenSSL DLLs at runtime.'
+          }
+
+          # 3) config templates straight from the source tree (always present)
+          $confs = @(
+            'src/server/apps/worldserver/worldserver.conf.dist',
+            'src/server/apps/authserver/authserver.conf.dist',
+            'src/tools/dbimport/dbimport.conf.dist'
+          )
+          foreach ($c in $confs) {
+            if (Test-Path $c) {
+              Copy-Item $c -Destination $etcDir -Force
+              Write-Host ("copied conf: {0}" -f $c)
+            } else {
+              Write-Host ("WARNING: missing conf template {0}" -f $c)
+            }
+          }
+
+          # 4) the provenance file travels with the artifact
+          Copy-Item build-provenance.txt -Destination $stage -Force
+
+          Write-Host ''
+          Write-Host '--- staged artifact tree ---'
+          Get-ChildItem $stage -Recurse -Force |
+            Select-Object @{n='Path';e={$_.FullName.Replace($stage, '')}}, Length |
+            Format-Table -AutoSize |
+            Out-String -Width 200 |
+            Write-Host
+
+          Add-Content -Path $env:GITHUB_ENV -Value "STAGE=$stage" -Encoding utf8
+
       - name: Verify server binaries exist
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $candidates = @(
-            'env/dist/bin/worldserver.exe',
-            'env/dist/bin/authserver.exe',
-            'build/bin/RelWithDebInfo/worldserver.exe',
-            'build/bin/RelWithDebInfo/authserver.exe'
-          )
-          foreach ($c in $candidates) {
-            Write-Host ("{0,-52} {1}" -f $c, (Test-Path $c))
+          $ws  = Join-Path $env:STAGE 'bin/worldserver.exe'
+          $as  = Join-Path $env:STAGE 'bin/authserver.exe'
+          $ok  = $true
+          foreach ($f in @($ws, $as)) {
+            $exists = Test-Path $f
+            Write-Host ("{0,-24} {1}" -f (Split-Path $f -Leaf), $exists)
+            if (-not $exists) { $ok = $false }
           }
-          $ws = $candidates | Where-Object { $_ -like '*worldserver.exe' -and (Test-Path $_) }
-          $as = $candidates | Where-Object { $_ -like '*authserver.exe' -and (Test-Path $_) }
-          if (-not $ws) { throw 'worldserver.exe was not produced anywhere expected.' }
-          if (-not $as) { throw 'authserver.exe was not produced anywhere expected.' }
-          Write-Host 'OK: both server binaries found.'
-          Get-FileHash $ws -Algorithm SHA256 | ForEach-Object { "worldserver.exe $($_.Hash)" }
-          Get-FileHash $as -Algorithm SHA256 | ForEach-Object { "authserver.exe $($_.Hash)" }
+          if (-not $ok) { throw 'Staged runtime is missing a server binary.' }
+          Write-Host ''
+          Write-Host 'SHA256:'
+          Get-FileHash $ws -Algorithm SHA256 | ForEach-Object { "  worldserver.exe $($_.Hash)" }
+          Get-FileHash $as -Algorithm SHA256 | ForEach-Object { "  authserver.exe  $($_.Hash)" }
+          Write-Host ''
+          Write-Host 'OK: both server binaries staged.'
 
-      - name: Upload server binaries
+      - name: Upload server artifact
         uses: actions/upload-artifact@v4
         with:
-          name: asp-server-win64-${{ github.sha }}
+          name: ${{ env.ARTIFACT_NAME || format('asp-server-win64-{0}', github.sha) }}
           if-no-files-found: error
           retention-days: ${{ inputs.retention_days || 30 }}
-          path: |
-            env/dist/bin/worldserver.exe
-            env/dist/bin/authserver.exe
-            env/dist/bin/*.dll
-            env/dist/etc/*.conf.dist
-            build/bin/RelWithDebInfo/worldserver.exe
-            build/bin/RelWithDebInfo/authserver.exe
-            build/bin/RelWithDebInfo/*.dll
-            build-provenance.txt
+          path: ${{ env.STAGE }}
