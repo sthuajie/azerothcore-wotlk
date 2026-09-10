@@ -1,6 +1,14 @@
 name: windows-build
 
+# ASP-maintenance addition: allow triggering a build by hand on any branch.
 on:
+  workflow_dispatch:
+    inputs:
+      retention_days:
+        description: 'Artifact retention in days'
+        required: false
+        default: '30'
+        type: string
   push:
     branches: [ "Playerbot", "test-staging" ]
   pull_request:
@@ -148,3 +156,90 @@ jobs:
         run: |
           export CTOOLS_BUILD=all
           ./acore.sh compiler build
+
+      # --- ASP-maintenance additions -------------------------------------------
+      # The upstream workflow ended at the build, so the compiled server was
+      # destroyed with the runner. Record what was produced, prove both server
+      # binaries exist, then publish them as a downloadable artifact.
+      - name: Record provenance
+        if: always()
+        shell: pwsh
+        run: |
+          $coreSha  = (git rev-parse HEAD)
+          $coreDate = (git log -1 --format=%cI)
+          $coreSubj = (git log -1 --format=%s)
+          $modSha   = (git -C modules/mod-playerbots rev-parse HEAD)
+          $modDate  = (git -C modules/mod-playerbots log -1 --format=%cI)
+          $modSubj  = (git -C modules/mod-playerbots log -1 --format=%s)
+          $lines = @(
+            "generated_utc      = $(Get-Date -AsUTC -Format o)"
+            "core_repository    = ${{ github.repository }}"
+            "core_ref           = ${{ github.ref_name }}"
+            "core_commit        = $coreSha"
+            "core_commit_date   = $coreDate"
+            "core_subject       = $coreSubj"
+            "module_repository  = mod-playerbots/mod-playerbots"
+            "module_commit      = $modSha"
+            "module_commit_date = $modDate"
+            "module_subject     = $modSubj"
+            "runner_os          = ${{ runner.os }}"
+            "build_type         = RelWithDebInfo"
+            "trigger            = ${{ github.event_name }}"
+          )
+          $lines | Out-File -FilePath build-provenance.txt -Encoding utf8
+          $lines | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+          Get-Content build-provenance.txt
+
+      - name: Show build output layout
+        if: always()
+        shell: pwsh
+        run: |
+          foreach ($d in @('env/dist', 'env/dist/bin', 'env/dist/etc', 'build/bin', 'build/bin/RelWithDebInfo')) {
+            Write-Host "==== $d ===="
+            if (Test-Path $d) {
+              Get-ChildItem $d -Force |
+                Select-Object Mode, Length, Name |
+                Format-Table -AutoSize |
+                Out-String -Width 200 |
+                Write-Host
+            } else {
+              Write-Host "(missing)"
+            }
+          }
+
+      - name: Verify server binaries exist
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $candidates = @(
+            'env/dist/bin/worldserver.exe',
+            'env/dist/bin/authserver.exe',
+            'build/bin/RelWithDebInfo/worldserver.exe',
+            'build/bin/RelWithDebInfo/authserver.exe'
+          )
+          foreach ($c in $candidates) {
+            Write-Host ("{0,-52} {1}" -f $c, (Test-Path $c))
+          }
+          $ws = $candidates | Where-Object { $_ -like '*worldserver.exe' -and (Test-Path $_) }
+          $as = $candidates | Where-Object { $_ -like '*authserver.exe' -and (Test-Path $_) }
+          if (-not $ws) { throw 'worldserver.exe was not produced anywhere expected.' }
+          if (-not $as) { throw 'authserver.exe was not produced anywhere expected.' }
+          Write-Host 'OK: both server binaries found.'
+          Get-FileHash $ws -Algorithm SHA256 | ForEach-Object { "worldserver.exe $($_.Hash)" }
+          Get-FileHash $as -Algorithm SHA256 | ForEach-Object { "authserver.exe $($_.Hash)" }
+
+      - name: Upload server binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: asp-server-win64-${{ github.sha }}
+          if-no-files-found: error
+          retention-days: ${{ inputs.retention_days || 30 }}
+          path: |
+            env/dist/bin/worldserver.exe
+            env/dist/bin/authserver.exe
+            env/dist/bin/*.dll
+            env/dist/etc/*.conf.dist
+            build/bin/RelWithDebInfo/worldserver.exe
+            build/bin/RelWithDebInfo/authserver.exe
+            build/bin/RelWithDebInfo/*.dll
+            build-provenance.txt
