@@ -55,6 +55,15 @@ jobs:
     name: ${{ matrix.os }}
     env:
       BOOST_ROOT: C:\local\boost_1_87_0
+      # ASP-maintenance: pin the MySQL client used for BOTH compilation and the
+      # collected runtime DLL. src/cmake/macros/FindMySQL.cmake searches
+      # ${MYSQL_ROOT_DIR} and ENV{MYSQL_ROOT_DIR} BEFORE the registry and
+      # "Program Files/MySQL" globs, so setting this makes the choice deterministic.
+      # Without it CMake silently took a different MySQL from the runner image than
+      # the one whose DLL was collected, and AzerothCore refuses to boot when the
+      # client header version and the loaded libmysql.dll version disagree
+      # (DatabaseWorkerPool.cpp isSameClientDB).
+      MYSQL_ROOT_DIR: C:\tools\mysql\current
       # ASP-maintenance: pin the module ref instead of deriving it from the core
       # branch. This project tracks the stable mod-playerbots master.
       MODULE_REF: ${{ inputs.module_ref != '' && inputs.module_ref || 'master' }}
@@ -263,6 +272,41 @@ jobs:
               Write-Host "(missing)"
             }
           }
+      - name: Verify MySQL client consistency
+        if: always()
+        shell: pwsh
+        run: |
+          # AzerothCore refuses to boot when the MySQL client version baked into the
+          # binary disagrees with the libmysql.dll loaded at runtime
+          # (DatabaseWorkerPool.cpp, isSameClientDB). The previous build hit exactly
+          # that: CMake picked a MySQL out of the runner image while the packaged DLL
+          # came from MYSQL_ROOT_DIR. This surfaces the mismatch in the CI log rather
+          # than only at server start-up on the user's machine.
+          $ErrorActionPreference = 'Continue'
+          Write-Host ("MYSQL_ROOT_DIR env : {0}" -f $env:MYSQL_ROOT_DIR)
+
+          $hdr = Join-Path $env:MYSQL_ROOT_DIR 'include\mysql_version.h'
+          if (Test-Path $hdr) {
+            Write-Host ("mysql_version.h    : {0}" -f $hdr)
+            Get-Content $hdr | Where-Object { $_ -match 'MYSQL_VERSION_(MAJOR|MINOR|PATCH)' } | ForEach-Object { "    $_" }
+          } else {
+            Write-Host ("mysql_version.h    : NOT FOUND at {0}" -f $hdr)
+          }
+
+          foreach ($cand in @('lib\mysqlclient.lib', 'lib\libmysql.lib', 'lib\libmysql.dll')) {
+            $cp = Join-Path $env:MYSQL_ROOT_DIR $cand
+            if (Test-Path $cp) {
+              Write-Host ("{0,-22}: {1}  ({2:N0} bytes)" -f $cand, $cp, (Get-Item $cp).Length)
+            } else {
+              Write-Host ("{0,-22}: not present" -f $cand)
+            }
+          }
+
+          Write-Host ''
+          Write-Host 'The CMake configure output must name include/lib paths under MYSQL_ROOT_DIR.'
+          Write-Host 'If it names a different MySQL, the binary and the packaged libmysql.dll will'
+          Write-Host 'disagree and the server will refuse to start with isSameClientDB.'
+
       - name: Locate built server binaries
         shell: pwsh
         run: |
@@ -417,7 +461,8 @@ jobs:
             return $null
           }
 
-          $mysqlRoot  = 'C:\tools\mysql\current'
+          $mysqlRoot  = $env:MYSQL_ROOT_DIR
+          if (-not $mysqlRoot) { $mysqlRoot = 'C:\tools\mysql\current' }
           $opensslRoot = $env:OPENSSL_ROOT_DIR
           Write-Host ''
           Write-Host ("search root (mysql)   : {0}" -f $mysqlRoot)
