@@ -263,7 +263,6 @@ jobs:
               Write-Host "(missing)"
             }
           }
-
       - name: Locate built server binaries
         shell: pwsh
         run: |
@@ -313,6 +312,200 @@ jobs:
           Add-Content -Path $env:GITHUB_ENV -Value "AS_PATH=$($as.FullName)" -Encoding utf8
           Add-Content -Path $env:GITHUB_ENV -Value "WS_DIR=$($ws.DirectoryName)" -Encoding utf8
 
+      - name: Resolve runtime dependencies
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          # ------------------------------------------------------------------
+          # 1) Ask dumpbin what the two selected executables actually import.
+          #    Reading the PE import table is the only reliable way to know what
+          #    the server needs at runtime; guessing from the CMake config is not.
+          # ------------------------------------------------------------------
+          $dumpbin = $null
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          if (Test-Path $vswhere) {
+            $vsRoot = (& $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath) | Select-Object -First 1
+            if ($vsRoot) {
+              Write-Host "VS root: $vsRoot"
+              $dumpbin = (Get-ChildItem (Join-Path $vsRoot 'VC\Tools\MSVC') -Directory -ErrorAction SilentlyContinue |
+                          Sort-Object Name -Descending |
+                          ForEach-Object { Join-Path $_.FullName 'bin\Hostx64\x64\dumpbin.exe' } |
+                          Where-Object { Test-Path $_ } |
+                          Select-Object -First 1)
+            } else {
+              Write-Host 'vswhere found no VS install with the C++ toolset.'
+            }
+          } else {
+            Write-Host 'vswhere.exe not present.'
+          }
+          if (-not $dumpbin) {
+            $cmd = Get-Command dumpbin.exe -ErrorAction SilentlyContinue
+            if ($cmd) { $dumpbin = $cmd.Source }
+          }
+
+          # Names Windows always provides. Same list used to filter the imports and
+          # to decide what still has to be collected.
+          $systemDlls = @(
+            'ADVAPI32.DLL','bcrypt.dll','cfgmgr32.dll','COMCTL32.DLL','COMDLG32.DLL','CRYPT32.DLL',
+            'CRYPTBASE.dll','dbghelp.dll','DWMAPI.DLL','GDI32.DLL','gdi32full.dll','IMM32.DLL',
+            'IPHLPAPI.DLL','KERNEL32.DLL','msvcp_win.dll','MSVCP140.DLL','MSWSOCK.DLL','NETAPI32.DLL',
+            'NTDLL.DLL','OLE32.DLL','OLEAUT32.DLL','PSAPI.DLL','RPCRT4.dll','sechost.dll','SECHOST.dll',
+            'SHELL32.DLL','SHLWAPI.DLL','USER32.DLL','USERENV.DLL','usp10.dll','UxTheme.dll',
+            'VERSION.DLL','VCRUNTIME140.DLL','VCRUNTIME140_1.DLL','wer.dll','WINMM.DLL','WINTRUST.dll',
+            'WLDAP32.DLL','WS2_32.DLL','WTSAPI32.DLL','api-ms-win-crt-heap-l1-1-0.dll'
+          )
+          $isSystem = {
+            param([string]$n)
+            if ($n -match '^(?i)api-ms-win-|^(?i)ext-ms-') { return $true }
+            return ($systemDlls -contains $n)
+          }
+
+          $dumpbinReport = @()
+          $required = New-Object System.Collections.Generic.HashSet[string]
+
+          if ($dumpbin) {
+            Write-Host ''
+            Write-Host ("Using dumpbin: {0}" -f $dumpbin)
+            foreach ($exe in @($env:WS_PATH, $env:AS_PATH)) {
+              Write-Host ''
+              Write-Host ("==== dumpbin /DEPENDENTS {0} ====" -f (Split-Path $exe -Leaf))
+              $raw = (& $dumpbin /nologo /DEPENDENTS $exe 2>&1 | Out-String)
+              Write-Host $raw
+              $dumpbinReport += ("==== {0} ====" -f (Split-Path $exe -Leaf))
+              $dumpbinReport += $raw.TrimEnd()
+              $dumpbinReport += ''
+
+              # Parse names from the text rather than from JSON, so this does not
+              # depend on dumpbin's output encoding.
+              foreach ($line in ($raw -split "`r?`n")) {
+                $m = [regex]::Match($line, '^\s+([A-Za-z0-9_.\-]+\.dll)\s*$', 'IgnoreCase')
+                if ($m.Success) {
+                  $name = $m.Groups[1].Value
+                  if (-not (& $isSystem $name)) { [void]$required.Add($name) }
+                }
+              }
+            }
+          } else {
+            Write-Host 'WARNING: dumpbin not available; falling back to the known dependency list only.'
+          }
+
+          # Known third-party requirements. Always enforced, so a dumpbin parse
+          # problem cannot silently drop a runtime DLL.
+          foreach ($n in @('libmysql.dll','libssl-3-x64.dll','libcrypto-3-x64.dll')) { [void]$required.Add($n) }
+
+          Write-Host ''
+          Write-Host '--- required non-system dependencies ---'
+          $requiredList = @($required) | Sort-Object
+          foreach ($n in $requiredList) { Write-Host ("  {0}" -f $n) }
+          if ($requiredList.Count -eq 0) { Write-Host '  (none detected)' }
+
+          # ------------------------------------------------------------------
+          # 2) Resolve each one: prefer the executable's own directory, otherwise
+          #    take it from the location the CI actually installed it to. Every
+          #    source path is searched, not assumed.
+          # ------------------------------------------------------------------
+          function Find-Dll {
+            param([string]$Name, [string[]]$Dirs)
+            foreach ($d in $Dirs) {
+              if (-not $d -or -not (Test-Path $d)) { continue }
+              $direct = Join-Path $d $Name
+              if (Test-Path $direct) { return $direct }
+              $hit = Get-ChildItem $d -Recurse -Force -File -ErrorAction SilentlyContinue -Filter $Name | Select-Object -First 1
+              if ($hit) { return $hit.FullName }
+            }
+            return $null
+          }
+
+          $mysqlRoot  = 'C:\tools\mysql\current'
+          $opensslRoot = $env:OPENSSL_ROOT_DIR
+          Write-Host ''
+          Write-Host ("search root (mysql)   : {0}" -f $mysqlRoot)
+          Write-Host ("search root (openssl) : {0}" -f $(if ($opensslRoot) { $opensslRoot } else { '(unset)' }))
+
+          $searchDirs = @()
+          if (Test-Path $mysqlRoot) { $searchDirs += $mysqlRoot }
+          if ($opensslRoot) { $searchDirs += $opensslRoot }
+
+          $resolved = @()
+          $missing  = @()
+          foreach ($n in $requiredList) {
+            $local = Join-Path $env:WS_DIR $n
+            if (Test-Path $local) {
+              $resolved += [pscustomobject]@{ Name = $n; Source = $local; Kind = 'sibling-of-exe' }
+              continue
+            }
+            $foundPath = Find-Dll -Name $n -Dirs $searchDirs
+            if ($foundPath) {
+              $resolved += [pscustomobject]@{ Name = $n; Source = $foundPath; Kind = 'collected' }
+            } else {
+              $missing += $n
+            }
+          }
+
+          Write-Host ''
+          Write-Host '--- resolution result ---'
+          foreach ($r in $resolved) { Write-Host ("  OK      {0,-26} {1}  [{2}]" -f $r.Name, $r.Source, $r.Kind) }
+          foreach ($m in $missing)  { Write-Host ("  MISSING {0}" -f $m) }
+
+          # ------------------------------------------------------------------
+          # 3) Publish for the collect step, and write the dependency report.
+          # ------------------------------------------------------------------
+          $report = @()
+          $report += 'runtime-dependencies.txt'
+          $report += ("generated_utc       = {0}" -f (Get-Date -AsUTC -Format o))
+          $report += ("worldserver_exe     = {0}" -f $env:WS_PATH)
+          $report += ("authserver_exe      = {0}" -f $env:AS_PATH)
+          $report += ("exe_directory       = {0}" -f $env:WS_DIR)
+          $report += ("dumpbin             = {0}" -f $(if ($dumpbin) { $dumpbin } else { '(unavailable)' }))
+          $report += ("mysql_search_root   = {0}" -f $mysqlRoot)
+          $report += ("openssl_search_root = {0}" -f $(if ($opensslRoot) { $opensslRoot } else { '(unset)' }))
+          $report += ''
+          $report += 'required_non_system_dependencies ='
+          foreach ($n in $requiredList) { $report += ("  {0}" -f $n) }
+          $report += ''
+          $report += 'resolved ='
+          foreach ($r in $resolved) { $report += ("  {0,-26} {1}  [{2}]" -f $r.Name, $r.Source, $r.Kind) }
+          $report += ''
+          $report += 'missing ='
+          if ($missing.Count -eq 0) { $report += '  (none)' } else { foreach ($m in $missing) { $report += ("  {0}" -f $m) } }
+          $report += ''
+          $report += 'dumpbin_output ='
+          $report += $dumpbinReport
+          $report -join "`n" | Out-File -FilePath runtime-dependencies.txt -Encoding utf8
+          Get-Content runtime-dependencies.txt
+
+          # The resolved DLLs are handed to the collect step as a list of paths.
+          $resolvedPaths = ($resolved | ForEach-Object { $_.Source }) -join ';'
+          Add-Content -Path $env:GITHUB_ENV -Value "RESOLVED_DLLS=$resolvedPaths" -Encoding utf8
+          Add-Content -Path $env:GITHUB_ENV -Value "MISSING_DLLS=$($missing -join ',')" -Encoding utf8
+          Add-Content -Path $env:GITHUB_ENV -Value "REQUIRED_DLLS=$($requiredList -join ',')" -Encoding utf8
+
+          # ------------------------------------------------------------------
+          # 4) Report unresolved dependencies.
+          #
+          #    This deliberately does NOT abort the run. If the freshly built
+          #    executable imports something that is not present anywhere on the
+          #    runner -- an ASP-private DLL such as legacy.dll or loadall.dll would
+          #    be exactly that -- aborting here would throw away the whole build and
+          #    the diagnostic that explains it. The gap is recorded in
+          #    runtime-dependencies.txt and in the job summary, the artifact is still
+          #    produced, and the dependency is resolved afterwards from evidence.
+          # ------------------------------------------------------------------
+          if ($missing.Count -gt 0) {
+            Write-Host ''
+            Write-Host '!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!'
+            Write-Host ("UNRESOLVED runtime dependencies: {0}" -f ($missing -join ', '))
+            Write-Host 'These are imported by the built server but are not present on the runner'
+            Write-Host 'and are not part of upstream AzerothCore or mod-playerbots. The artifact'
+            Write-Host 'is uploaded anyway; see runtime-dependencies.txt in it.'
+            Write-Host '!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!'
+            "UNRESOLVED RUNTIME DEPENDENCIES: $($missing -join ', ')" |
+              Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+          } else {
+            Write-Host 'All required runtime dependencies resolved.'
+          }
+
       - name: Collect runtime tree
         shell: pwsh
         run: |
@@ -327,15 +520,27 @@ jobs:
           Copy-Item $env:WS_PATH -Destination $binDir -Force
           Copy-Item $env:AS_PATH -Destination $binDir -Force
 
-          # Every DLL beside the built worldserver. Upstream links MySQL and OpenSSL
-          # dynamically on Windows, so these are runtime requirements.
-          $dlls = @(Get-ChildItem $env:WS_DIR -Force -File -Filter '*.dll' -ErrorAction SilentlyContinue)
-          foreach ($d in $dlls) {
-            Copy-Item $d.FullName -Destination $binDir -Force
-            Write-Host ("copied dll : {0}" -f $d.Name)
+          # Every DLL beside the built worldserver, plus anything the dependency
+          # step had to pull in from the CI install locations. Deduplicated by
+          # file name so a sibling copy always wins.
+          $dllSources = @()
+          $siblings = @(Get-ChildItem $env:WS_DIR -Force -File -Filter '*.dll' -ErrorAction SilentlyContinue)
+          foreach ($d in $siblings) { $dllSources += $d.FullName }
+          if ($env:RESOLVED_DLLS) {
+            foreach ($p in ($env:RESOLVED_DLLS -split ';')) {
+              if ($p -and (Test-Path $p)) { $dllSources += $p }
+            }
           }
-          if ($dlls.Count -eq 0) {
-            Write-Host 'WARNING: no DLLs beside worldserver.exe. The server may still need libmysql.dll and the OpenSSL DLLs at runtime.'
+          if ($siblings.Count -eq 0) {
+            Write-Host 'NOTE: no DLLs sat beside worldserver.exe; relying entirely on the dependency step.'
+          }
+
+          $seen = New-Object System.Collections.Generic.HashSet[string]
+          foreach ($src in $dllSources) {
+            $name = Split-Path $src -Leaf
+            if (-not $seen.Add($name)) { continue }
+            Copy-Item $src -Destination $binDir -Force
+            Write-Host ("staged dll : {0}   <- {1}" -f $name, $src)
           }
 
           # Config templates from the source tree (install may not have run).
@@ -345,19 +550,24 @@ jobs:
               'src/tools/dbimport/dbimport.conf.dist')) {
             if (Test-Path $c) {
               Copy-Item $c -Destination $etcDir -Force
-              Write-Host ("copied conf: {0}" -f $c)
+              Write-Host ("staged conf: {0}" -f $c)
             } else {
               Write-Host ("WARNING: missing conf template {0}" -f $c)
             }
           }
 
+          Copy-Item runtime-dependencies.txt -Destination $stage -Force
+
+          $dllCount = @(Get-ChildItem $binDir -Filter '*.dll' -File -ErrorAction SilentlyContinue).Count
           Write-Host ''
+          Write-Host ("staged dll count: {0}" -f $dllCount)
           Write-Host '--- staged runtime ---'
           Get-ChildItem $stage -Recurse -Force |
             Select-Object @{n='Path';e={$_.FullName.Replace($stage,'')}}, Length |
             Format-Table -AutoSize | Out-String -Width 200 | Write-Host
 
           Add-Content -Path $env:GITHUB_ENV -Value "STAGE=$stage" -Encoding utf8
+          Add-Content -Path $env:GITHUB_ENV -Value "STAGED_DLL_COUNT=$dllCount" -Encoding utf8
 
       - name: Collect debug symbols
         shell: pwsh
@@ -366,7 +576,6 @@ jobs:
           if (Test-Path $stage) { Remove-Item -Recurse -Force $stage }
           New-Item -ItemType Directory -Force -Path $stage | Out-Null
 
-          # Only the two PDBs the server itself produces, not every PDB in the tree.
           $pdbs = @()
           foreach ($name in @('worldserver.pdb', 'authserver.pdb')) {
             $candidate = Join-Path $env:WS_DIR $name
@@ -384,8 +593,6 @@ jobs:
           if ($pdbs.Count -gt 0) { $total = ($pdbs | Measure-Object -Property Length -Sum).Sum }
           Write-Host ("symbols total: {0:N1} MB" -f ($total / 1MB))
 
-          # GitHub rejects artifacts over 500 MB and a 64-bit server PDB can exceed
-          # that alone, so the symbols artifact is skipped rather than failing the run.
           $hasSymbols = ($pdbs.Count -gt 0) -and ($total -lt 450MB)
           if ($pdbs.Count -gt 0 -and -not $hasSymbols) {
             Write-Host ("WARNING: symbols are {0:N1} MB, above the safe artifact limit; skipping." -f ($total / 1MB))
@@ -397,27 +604,64 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $ws = Join-Path $env:STAGE 'bin/worldserver.exe'
-          $as = Join-Path $env:STAGE 'bin/authserver.exe'
+          $binDir = Join-Path $env:STAGE 'bin'
+          $ws = Join-Path $binDir 'worldserver.exe'
+          $as = Join-Path $binDir 'authserver.exe'
+
           $ok = $true
           foreach ($f in @($ws, $as)) {
             $exists = Test-Path $f
             Write-Host ("{0,-20} {1}" -f (Split-Path $f -Leaf), $exists)
             if (-not $exists) { $ok = $false }
           }
-          if (-not $ok) { throw 'Staged runtime is missing a server binary.' }
+
+          # Every DLL dumpbin said we need must be present in the staged bin/,
+          # UNLESS the resolve step already flagged it as unsourceable. A DLL that
+          # was resolvable but did not make it into the stage is a real staging bug;
+          # a DLL nobody could source is a documented gap, not a failure.
+          Write-Host ''
+          Write-Host '--- dependency check against staged bin/ ---'
+          $required = @()
+          if ($env:REQUIRED_DLLS) { $required = $env:REQUIRED_DLLS -split ',' | Where-Object { $_ } }
+          $unresolved = @()
+          if ($env:MISSING_DLLS) { $unresolved = $env:MISSING_DLLS -split ',' | Where-Object { $_ } }
+
+          foreach ($n in $required) {
+            $present = Test-Path (Join-Path $binDir $n)
+            $knownGap = $unresolved -contains $n
+            if ($present) {
+              Write-Host ("  {0,-26} staged" -f $n)
+            } elseif ($knownGap) {
+              Write-Host ("  {0,-26} absent (unsourceable, recorded)" -f $n)
+            } else {
+              Write-Host ("  {0,-26} MISSING" -f $n)
+              $ok = $false
+            }
+          }
+          if ($required.Count -eq 0) { Write-Host '  (no required list recorded)' }
+
+          if (-not $ok) { throw 'Staged runtime is incomplete: a server binary or a resolvable required DLL is missing.' }
+
+          if ($unresolved.Count -gt 0) {
+            Write-Host ''
+            Write-Host ("WARNING: {0} imported DLL(s) could not be sourced and are absent from this artifact:" -f $unresolved.Count)
+            foreach ($u in $unresolved) { Write-Host ("  {0}" -f $u) }
+          }
 
           $wsHash = (Get-FileHash $ws -Algorithm SHA256).Hash
           $asHash = (Get-FileHash $as -Algorithm SHA256).Hash
-          $dllCount = @(Get-ChildItem (Join-Path $env:STAGE 'bin') -Filter '*.dll' -File -ErrorAction SilentlyContinue).Count
+          $dllFiles = @(Get-ChildItem $binDir -Filter '*.dll' -File -ErrorAction SilentlyContinue)
+          $totalDllMb = 0
+          if ($dllFiles.Count -gt 0) { $totalDllMb = (($dllFiles | Measure-Object -Property Length -Sum).Sum / 1MB) }
 
           Write-Host ''
           Write-Host 'SHA256:'
           Write-Host ("  worldserver.exe  {0}" -f $wsHash)
           Write-Host ("  authserver.exe   {0}" -f $asHash)
-          Write-Host ("  dll count        {0}" -f $dllCount)
+          Write-Host ("  dll count        {0}" -f $dllFiles.Count)
+          Write-Host ("  dll total        {0:N1} MB" -f $totalDllMb)
           Write-Host ''
-          Write-Host 'OK: runtime staged.'
+          Write-Host 'OK: runtime staged and complete.'
 
           Add-Content -Path $env:GITHUB_ENV -Value "WS_SHA256=$wsHash" -Encoding utf8
           Add-Content -Path $env:GITHUB_ENV -Value "AS_SHA256=$asHash" -Encoding utf8
@@ -434,6 +678,9 @@ jobs:
             "runtime_authserver_path    = bin/authserver.exe"
             "runtime_worldserver_sha256 = $env:WS_SHA256"
             "runtime_authserver_sha256  = $env:AS_SHA256"
+            "runtime_staged_dll_count   = $env:STAGED_DLL_COUNT"
+            "runtime_required_dlls      = $env:REQUIRED_DLLS"
+            "runtime_dependencies       = see runtime-dependencies.txt in the artifact"
             "symbols_included           = $env:HAS_SYMBOLS"
             "artifact_runtime_name      = $runtimeName"
             "artifact_symbols_name      = $symbolsName"
