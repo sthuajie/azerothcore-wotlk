@@ -224,43 +224,93 @@ jobs:
               Write-Host "OpenSSL already present at $osslRoot"
           }
 
-          # Fail fast if the install did not lay down a complete tree, rather than
-          # discovering it later when the legacy provider refuses to load.
-          $osslChecks = @{
-              'include\openssl\opensslv.h' = 'headers'
-              'lib\libcrypto.lib'           = 'crypto import library'
-              'lib\libssl.lib'              = 'ssl import library'
-              'libcrypto-3-x64.dll'          = 'crypto runtime'
-              'libssl-3-x64.dll'             = 'ssl runtime'
-              'bin\legacy.dll'              = 'legacy provider module'
-          }
-          $osslMissing = @()
-          foreach ($rel in $osslChecks.Keys)
-          {
-              $full = Join-Path $osslRoot $rel
-              $state = if (Test-Path $full) { 'ok' } else { $osslMissing += $rel; 'MISSING' }
-              Write-Host ("  {0,-32} {1,-24} {2}" -f $rel, $osslChecks[$rel], $state)
-          }
-          if ($osslMissing.Count -gt 0)
-          {
-              throw ("Incomplete OpenSSL installation at {0}: missing {1}" -f $osslRoot, ($osslMissing -join ', '))
+          # The Shining Light Windows package does NOT place the import libraries at
+          # <root>\lib\. It uses an MSVC variant layout and the dynamic ones live under
+          # lib\VC\<arch>\<crt>. Enumerate rather than assume, and dump the tree so a
+          # future layout change shows up in the log.
+          Write-Host ''
+          Write-Host '=== OpenSSL lib/ tree (4 levels) ==='
+          $libRoot = Join-Path $osslRoot 'lib'
+          if (-not (Test-Path $libRoot)) { throw "OpenSSL lib directory missing at $libRoot" }
+          Get-ChildItem $libRoot -Recurse -Depth 4 -Force -ErrorAction SilentlyContinue |
+            Select-Object @{n='Rel';e={$_.FullName.Replace($osslRoot,'.')}}, Length |
+            Format-Table -AutoSize | Out-String -Width 160 | Write-Host
+
+          Write-Host '=== candidate import libraries ==='
+          Get-ChildItem $libRoot -Recurse -Force -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -in @('libssl.lib','libcrypto.lib','libssl_static.lib','libcrypto_static.lib') } |
+            ForEach-Object { Write-Host ("  {0,-62} {1,12:N0} B" -f $_.FullName.Replace($osslRoot,'.'), $_.Length) }
+
+          # Requirement: x64 + dynamic + MSVC release CRT.
+          #   * never *_static.lib
+          #   * prefer the MD (release CRT) variant over MDd / MT / MTd
+          #   * both libraries from the SAME variant directory
+          # The choice is asserted by CONTENT, not just by directory name: a genuine
+          # import library references its DLL and carries __imp_ thunks.
+          $preferred = Join-Path $libRoot 'VC\x64\MD'
+          $sslLib    = Join-Path $preferred 'libssl.lib'
+          $cryptoLib = Join-Path $preferred 'libcrypto.lib'
+
+          $problems = @()
+          if (-not (Test-Path $sslLib))    { $problems += "missing $sslLib" }
+          if (-not (Test-Path $cryptoLib)) { $problems += "missing $cryptoLib" }
+          if ($problems.Count -gt 0) {
+            throw ("OpenSSL dynamic import libraries not found: {0}" -f ($problems -join '; '))
           }
 
-          # Record what the compile step will actually pick up.
+          foreach ($pair in @(@('libssl.lib', $sslLib), @('libcrypto.lib', $cryptoLib))) {
+            $name = $pair[0]
+            $path = $pair[1]
+            if ($name -like '*_static*') { throw "$name is a static library; the dynamic import library is required." }
+
+            $text = [System.Text.Encoding]::ASCII.GetString([System.IO.File]::ReadAllBytes($path))
+            $refsDll = $text -match [regex]::Escape(($name -replace '\.lib$', '') + '-3-x64.dll')
+            $hasImp  = $text -match '__imp_'
+            Write-Host ''
+            Write-Host ("selected {0}" -f $path)
+            Write-Host ("   size     : {0:N0} B" -f (Get-Item $path).Length)
+            Write-Host ("   sha256   : {0}" -f (Get-FileHash $path -Algorithm SHA256).Hash)
+            Write-Host ("   refs DLL : {0}" -f $refsDll)
+            Write-Host ("   __imp_   : {0}" -f $hasImp)
+            if (-not $refsDll -or -not $hasImp) {
+              throw "$path does not look like a dynamic import library (refsDLL=$refsDll, __imp_=$hasImp)."
+            }
+          }
+
+          # The runtime modules must come from this same installation.
+          foreach ($rel in 'libcrypto-3-x64.dll','libssl-3-x64.dll','bin\legacy.dll','include\openssl\opensslv.h') {
+            $full = Join-Path $osslRoot $rel
+            if (-not (Test-Path $full)) { throw "OpenSSL installation incomplete: $full is missing." }
+            Write-Host ("  present {0,-34} {1,12:N0} B" -f $rel, (Get-Item $full).Length)
+          }
+
           $osslHdr = Join-Path $osslRoot 'include\openssl\opensslv.h'
           Write-Host ''
-          Write-Host ("OPENSSL_ROOT_DIR  : {0}" -f $osslRoot)
-          Write-Host ("OpenSSL include   : {0}" -f (Join-Path $osslRoot 'include\openssl'))
-          Write-Host ("crypto library    : {0}" -f (Join-Path $osslRoot 'lib\libcrypto.lib'))
-          Write-Host ("ssl library       : {0}" -f (Join-Path $osslRoot 'lib\libssl.lib'))
+          Write-Host ("OPENSSL_ROOT_DIR       : {0}" -f $osslRoot)
+          Write-Host ("OpenSSL include        : {0}" -f (Join-Path $osslRoot 'include\openssl'))
+          Write-Host ("OPENSSL_SSL_LIBRARY    : {0}" -f $sslLib)
+          Write-Host ("OPENSSL_CRYPTO_LIBRARY : {0}" -f $cryptoLib)
           Get-Content $osslHdr | Where-Object { $_ -match 'OPENSSL_VERSION_(TEXT|NUMBER)' } | ForEach-Object { "  $_" }
           Write-Host ("libcrypto-3-x64.dll version : {0}" -f (Get-Item (Join-Path $osslRoot 'libcrypto-3-x64.dll')).VersionInfo.FileVersion)
           Write-Host ("legacy.dll version          : {0}" -f (Get-Item (Join-Path $osslRoot 'bin\legacy.dll')).VersionInfo.FileVersion)
           Write-Host ''
+
+          # Hand the two libraries to CMake explicitly and record them.
+          Add-Content -Path $env:GITHUB_ENV -Value "OPENSSL_SSL_LIBRARY=$sslLib" -Encoding utf8
+          Add-Content -Path $env:GITHUB_ENV -Value "OPENSSL_CRYPTO_LIBRARY=$cryptoLib" -Encoding utf8
+          $custom = " -DOPENSSL_ROOT_DIR=$osslRoot -DOPENSSL_SSL_LIBRARY=$sslLib -DOPENSSL_CRYPTO_LIBRARY=$cryptoLib "
+          Add-Content -Path $env:GITHUB_ENV -Value "CCUSTOMOPTIONS=$custom" -Encoding utf8
+
       - name: Build
         shell: bash
         run: |
           export CTOOLS_BUILD=all
+          # conf/dist/config.sh does CCUSTOMOPTIONS=${CCUSTOMOPTIONS:-''} and
+          # apps/compiler/includes/functions.sh appends it to the cmake command line,
+          # so an exported value here reaches configure. The OpenSSL variables were
+          # published by the Configure OS step.
+          export CCUSTOMOPTIONS
+          echo "CCUSTOMOPTIONS=$CCUSTOMOPTIONS"
           ./acore.sh compiler build
 
       # ==========================================================================
