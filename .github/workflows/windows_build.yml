@@ -554,10 +554,10 @@ jobs:
           # Known third-party requirements. Always enforced, so a dumpbin parse
           # problem cannot silently drop a runtime DLL.
           #
-          # legacy.dll is in this list even though it is NOT a PE import: AzerothCore
-          # asserts at startup that the file exists next to the executable
-          # (OpenSSLCrypto.cpp, SetupLibrariesForWindows) and then has OpenSSL load it
-          # as the "legacy" provider. It is a runtime requirement all the same.
+          # legacy.dll is NOT a PE import: AzerothCore asserts at startup that the file
+          # exists next to the executable (OpenSSLCrypto::SetupLibrariesForWindows) and
+          # then has OpenSSL load it as the "legacy" provider. It is a hard runtime
+          # requirement, never optional.
           foreach ($n in @('libmysql.dll','libssl-3-x64.dll','libcrypto-3-x64.dll','legacy.dll')) { [void]$required.Add($n) }
 
           Write-Host ''
@@ -567,9 +567,22 @@ jobs:
           if ($requiredList.Count -eq 0) { Write-Host '  (none detected)' }
 
           # ------------------------------------------------------------------
-          # 2) Resolve each one: prefer the executable's own directory, otherwise
-          #    take it from the location the CI actually installed it to. Every
-          #    source path is searched, not assumed.
+          # 2) Resolve each dependency from its ONE permitted source.
+          #
+          #    The two stacks are managed independently and must not cross over:
+          #
+          #      MySQL client stack   libmysql.dll          <- MYSQL_ROOT_DIR
+          #
+          #      OpenSSL stack        libcrypto-3-x64.dll   <- OPENSSL_ROOT_DIR
+          #                           libssl-3-x64.dll     <- OPENSSL_ROOT_DIR
+          #                           legacy.dll (provider)<- OPENSSL_ROOT_DIR
+          #
+          #    Why enforced rather than preferred: the MySQL 8.4.x bundle ships its own
+          #    libcrypto/libssl, and an earlier build collected those while compiling
+          #    against a different OpenSSL. An OpenSSL provider module only loads into a
+          #    libcrypto from the same installation, so a mixed set yields a server that
+          #    cannot start. Each name is matched to exactly one root, and neither root
+          #    is ever searched for the other's files.
           # ------------------------------------------------------------------
           function Find-Dll {
             param([string]$Name, [string[]]$Dirs)
@@ -587,40 +600,81 @@ jobs:
           if (-not $mysqlRoot) { $mysqlRoot = 'C:\tools\mysql\current' }
           $opensslRoot = $env:OPENSSL_ROOT_DIR
           Write-Host ''
-          Write-Host ("search root (mysql)   : {0}" -f $mysqlRoot)
-          Write-Host ("search root (openssl) : {0}" -f $(if ($opensslRoot) { $opensslRoot } else { '(unset)' }))
+          Write-Host ("MYSQL_ROOT_DIR   = {0}" -f $mysqlRoot)
+          Write-Host ("OPENSSL_ROOT_DIR = {0}" -f $opensslRoot)
 
-          # OpenSSL's provider module lives in bin\, the shared libraries in the root,
-          # so both are searched.
-          $searchDirs = @()
-          if (Test-Path $mysqlRoot) { $searchDirs += $mysqlRoot }
-          if ($opensslRoot) {
-            $searchDirs += $opensslRoot
-            $searchDirs += (Join-Path $opensslRoot 'bin')
-            $searchDirs += (Join-Path $opensslRoot 'lib')
-            $searchDirs += (Join-Path $opensslRoot 'lib\ossl-modules')
+          $opensslDirs = @(
+            $opensslRoot,
+            (Join-Path $opensslRoot 'bin'),
+            (Join-Path $opensslRoot 'lib'),
+            (Join-Path $opensslRoot 'lib\ossl-modules')
+          )
+          $mysqlDirs = @(
+            $mysqlRoot,
+            (Join-Path $mysqlRoot 'lib'),
+            (Join-Path $mysqlRoot 'bin')
+          )
+
+          $sourcePolicy = @{
+            'libmysql.dll'        = @{ Root = 'mysql';   Dirs = $mysqlDirs }
+            'libcrypto-3-x64.dll' = @{ Root = 'openssl'; Dirs = $opensslDirs }
+            'libssl-3-x64.dll'    = @{ Root = 'openssl'; Dirs = $opensslDirs }
+            'legacy.dll'          = @{ Root = 'openssl'; Dirs = $opensslDirs }
           }
 
           $resolved = @()
           $missing  = @()
           foreach ($n in $requiredList) {
-            $local = Join-Path $env:WS_DIR $n
-            if (Test-Path $local) {
-              $resolved += [pscustomobject]@{ Name = $n; Source = $local; Kind = 'sibling-of-exe' }
+            $policy = $sourcePolicy[$n]
+            if (-not $policy) {
+              # A dependency neither stack owns: take it from beside the executable if
+              # it is there, otherwise record it as unresolved.
+              $sib = Join-Path $env:WS_DIR $n
+              if (Test-Path $sib) {
+                $resolved += [pscustomobject]@{ Name = $n; Root = 'exe-dir'; Source = $sib; Kind = 'sibling-of-exe' }
+              } else {
+                $missing += $n
+              }
               continue
             }
-            $foundPath = Find-Dll -Name $n -Dirs $searchDirs
-            if ($foundPath) {
-              $resolved += [pscustomobject]@{ Name = $n; Source = $foundPath; Kind = 'collected' }
+
+            $source = $null
+            $kind = $null
+
+            # A copy already beside the executable is acceptable only when it really
+            # comes from the permitted root. Anything else is rejected rather than
+            # silently kept -- that is how the MySQL-bundled OpenSSL slipped in before.
+            $sibling = Join-Path $env:WS_DIR $n
+            if (Test-Path $sibling) {
+              $siblingPath = (Resolve-Path $sibling).Path
+              $rootToUse = $mysqlRoot
+              if ($policy.Root -eq 'openssl') { $rootToUse = $opensslRoot }
+              $allowedRoot = (Resolve-Path $rootToUse).Path
+              if ($siblingPath.StartsWith($allowedRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
+                $source = $siblingPath
+                $kind = 'sibling-of-exe'
+              } else {
+                Write-Host ("  REJECT  {0,-22} sibling copy lies outside {1}: {2}" -f $n, $policy.Root, $siblingPath)
+              }
+            }
+
+            if (-not $source) {
+              $found = Find-Dll -Name $n -Dirs $policy.Dirs
+              if ($found) { $source = $found; $kind = 'collected-from-' + $policy.Root + '-root' }
+            }
+
+            if ($source) {
+              $resolved += [pscustomobject]@{ Name = $n; Root = $policy.Root; Source = $source; Kind = $kind }
             } else {
               $missing += $n
             }
           }
 
           Write-Host ''
-          Write-Host '--- resolution result ---'
-          foreach ($r in $resolved) { Write-Host ("  OK      {0,-26} {1}  [{2}]" -f $r.Name, $r.Source, $r.Kind) }
+          Write-Host '--- resolution result (one permitted source per dependency) ---'
+          foreach ($r in $resolved) { Write-Host ("  OK      {0,-22} [{1,-7}] {2}  ({3})" -f $r.Name, $r.Root, $r.Source, $r.Kind) }
           foreach ($m in $missing)  { Write-Host ("  MISSING {0}" -f $m) }
+
 
           # ------------------------------------------------------------------
           # 3) Publish for the collect step, and write the dependency report.
@@ -638,8 +692,8 @@ jobs:
           $report += 'required_non_system_dependencies ='
           foreach ($n in $requiredList) { $report += ("  {0}" -f $n) }
           $report += ''
-          $report += 'resolved ='
-          foreach ($r in $resolved) { $report += ("  {0,-26} {1}  [{2}]" -f $r.Name, $r.Source, $r.Kind) }
+          $report += 'source_map ='
+          foreach ($r in $resolved) { $report += ("  {0,-22} source={1}  root={2}  ({3})" -f $r.Name, $r.Source, $r.Root, $r.Kind) }
           $report += ''
           $report += 'missing ='
           if ($missing.Count -eq 0) { $report += '  (none)' } else { foreach ($m in $missing) { $report += ("  {0}" -f $m) } }
@@ -656,29 +710,31 @@ jobs:
           Add-Content -Path $env:GITHUB_ENV -Value "REQUIRED_DLLS=$($requiredList -join ',')" -Encoding utf8
 
           # ------------------------------------------------------------------
-          # 4) Report unresolved dependencies.
+          # 4) Unresolved dependencies are fatal.
           #
-          #    This deliberately does NOT abort the run. If the freshly built
-          #    executable imports something that is not present anywhere on the
-          #    runner -- an ASP-private DLL such as legacy.dll or loadall.dll would
-          #    be exactly that -- aborting here would throw away the whole build and
-          #    the diagnostic that explains it. The gap is recorded in
-          #    runtime-dependencies.txt and in the job summary, the artifact is still
-          #    produced, and the dependency is resolved afterwards from evidence.
+          #    Each dependency has exactly one permitted source. If a name could not be
+          #    obtained from it, the staged runtime is incomplete and the artifact would
+          #    download cleanly and then fail to start. Publishing it as a successful
+          #    build would be worse than failing here, so the run stops.
+          #
+          #    legacy.dll gets an explicit mention because it is the OpenSSL legacy
+          #    provider: not a PE import, but asserted to exist at startup.
           # ------------------------------------------------------------------
           if ($missing.Count -gt 0) {
             Write-Host ''
             Write-Host '!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!'
-            Write-Host ("UNRESOLVED runtime dependencies: {0}" -f ($missing -join ', '))
-            Write-Host 'These are imported by the built server but are not present on the runner'
-            Write-Host 'and are not part of upstream AzerothCore or mod-playerbots. The artifact'
-            Write-Host 'is uploaded anyway; see runtime-dependencies.txt in it.'
+            Write-Host ("MISSING runtime dependencies: {0}" -f ($missing -join ', '))
+            Write-Host 'Each dependency has exactly one permitted source. A name listed here could'
+            Write-Host 'not be sourced from it, so the artifact would not be able to start.'
             Write-Host '!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!'
-            "UNRESOLVED RUNTIME DEPENDENCIES: $($missing -join ', ')" |
+            "MISSING RUNTIME DEPENDENCIES: $($missing -join ', ')" |
               Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
-          } else {
-            Write-Host 'All required runtime dependencies resolved.'
+            if ($missing -contains 'legacy.dll') {
+              throw 'legacy.dll (the OpenSSL legacy provider) could not be sourced from OPENSSL_ROOT_DIR. It is a hard requirement: AzerothCore asserts its presence at startup.'
+            }
+            throw ("Runtime dependency resolution failed: {0}. Uploading a server artifact without them would produce a server that cannot start." -f ($missing -join ', '))
           }
+          Write-Host 'All required runtime dependencies resolved from their permitted source.'
 
       - name: Collect runtime tree
         shell: pwsh
@@ -694,27 +750,39 @@ jobs:
           Copy-Item $env:WS_PATH -Destination $binDir -Force
           Copy-Item $env:AS_PATH -Destination $binDir -Force
 
-          # Every DLL beside the built worldserver, plus anything the dependency
-          # step had to pull in from the CI install locations. Deduplicated by
-          # file name so a sibling copy always wins.
-          $dllSources = @()
-          $siblings = @(Get-ChildItem $env:WS_DIR -Force -File -Filter '*.dll' -ErrorAction SilentlyContinue)
-          foreach ($d in $siblings) { $dllSources += $d.FullName }
+          # Staging order matters. Every name that the resolution step decided on is
+          # staged first, from its permitted source. The executable's directory is then
+          # consulted only for names that were NOT resolved, so a copy lying next to the
+          # binary can never overwrite a policy-approved one.
+          $seen = New-Object System.Collections.Generic.HashSet[string]
+          $stagedFrom = @()
+
+          $resolvedList = @()
           if ($env:RESOLVED_DLLS) {
             foreach ($p in ($env:RESOLVED_DLLS -split ';')) {
-              if ($p -and (Test-Path $p)) { $dllSources += $p }
+              if ($p -and (Test-Path $p)) { $resolvedList += $p }
             }
           }
-          if ($siblings.Count -eq 0) {
-            Write-Host 'NOTE: no DLLs sat beside worldserver.exe; relying entirely on the dependency step.'
-          }
+          $resolvedNames = @($resolvedList | ForEach-Object { (Split-Path $_ -Leaf).ToLower() })
 
-          $seen = New-Object System.Collections.Generic.HashSet[string]
-          foreach ($src in $dllSources) {
+          foreach ($src in $resolvedList) {
             $name = Split-Path $src -Leaf
             if (-not $seen.Add($name)) { continue }
             Copy-Item $src -Destination $binDir -Force
-            Write-Host ("staged dll : {0}   <- {1}" -f $name, $src)
+            $stagedFrom += ("  {0,-22} <- {1}" -f $name, $src)
+            Write-Host ("staged dll : {0}   <- {1}   [resolved]" -f $name, $src)
+          }
+
+          $extras = @(Get-ChildItem $env:WS_DIR -Force -File -Filter '*.dll' -ErrorAction SilentlyContinue |
+                      Where-Object { -not $resolvedNames.Contains($_.Name.ToLower()) })
+          foreach ($d in $extras) {
+            if (-not $seen.Add($d.Name)) { continue }
+            Copy-Item $d.FullName -Destination $binDir -Force
+            $stagedFrom += ("  {0,-22} <- {1}" -f $d.Name, $d.FullName)
+            Write-Host ("staged dll : {0}   <- {1}   [extra, beside exe]" -f $d.Name, $d.FullName)
+          }
+          if ($resolvedList.Count -eq 0) {
+            Write-Host 'WARNING: nothing was resolved by the dependency step; only sibling DLLs were staged.'
           }
 
           # Config templates from the source tree (install may not have run).
@@ -803,32 +871,66 @@ jobs:
       - name: Record OpenSSL file inventory
         shell: pwsh
         run: |
-          # Every OpenSSL file shipped must come from the one installation named by
-          # OPENSSL_ROOT_DIR. Provenance records the versions and hashes so a mismatch
-          # is visible after the fact, not only during the run.
+          # Two guarantees are checked here, both fatal:
+          #
+          #   1. All three OpenSSL runtime files in the artifact came from the single
+          #      installation named by OPENSSL_ROOT_DIR -- verified by SHA256 against
+          #      the source file, not by name or version.
+          #   2. libmysql.dll came from MYSQL_ROOT_DIR. The two stacks are managed
+          #      separately and must not be confused for one another.
+          #
+          # The SHA256 comparison is mandatory: if the source cannot be located the run
+          # fails rather than skipping the check, because a skipped check is how a
+          # mixed-source runtime would reach the artifact unnoticed.
           $srvDir = Join-Path $env:STAGE 'bin'
           $lines = @()
-          $lines += "openssl_root_dir = $env:OPENSSL_ROOT_DIR"
+          $lines += "generated_utc    = $(Get-Date -AsUTC -Format o)"
+          $lines += "OPENSSL_ROOT_DIR = $env:OPENSSL_ROOT_DIR"
+          $lines += "MYSQL_ROOT_DIR   = $env:MYSQL_ROOT_DIR"
           $lines += ''
-          $lines += 'shipped_openssl_files ='
-          foreach ($n in @('libcrypto-3-x64.dll','libssl-3-x64.dll','legacy.dll')) {
-            $src = Join-Path $env:OPENSSL_ROOT_DIR $n
-            if (-not (Test-Path $src)) { $src = Join-Path (Join-Path $env:OPENSSL_ROOT_DIR 'bin') $n }
+          $lines += 'runtime_source_map ='
+
+          $expectations = @(
+            @{ Name = 'libcrypto-3-x64.dll'; Root = 'OPENSSL_ROOT_DIR'; RootPath = $env:OPENSSL_ROOT_DIR; Candidates = @($env:OPENSSL_ROOT_DIR, (Join-Path $env:OPENSSL_ROOT_DIR 'bin')) },
+            @{ Name = 'libssl-3-x64.dll';    Root = 'OPENSSL_ROOT_DIR'; RootPath = $env:OPENSSL_ROOT_DIR; Candidates = @($env:OPENSSL_ROOT_DIR, (Join-Path $env:OPENSSL_ROOT_DIR 'bin')) },
+            @{ Name = 'legacy.dll';          Root = 'OPENSSL_ROOT_DIR'; RootPath = $env:OPENSSL_ROOT_DIR; Candidates = @((Join-Path $env:OPENSSL_ROOT_DIR 'bin'), $env:OPENSSL_ROOT_DIR) },
+            @{ Name = 'libmysql.dll';        Root = 'MYSQL_ROOT_DIR';   RootPath = $env:MYSQL_ROOT_DIR;   Candidates = @((Join-Path $env:MYSQL_ROOT_DIR 'lib'), (Join-Path $env:MYSQL_ROOT_DIR 'bin'), $env:MYSQL_ROOT_DIR) }
+          )
+
+          foreach ($e in $expectations) {
+            $n = $e.Name
             $dst = Join-Path $srvDir $n
-            if (Test-Path $dst) {
-              $line = ("  {0,-24} version={1,-10} sha256={2}" -f $n, (Get-Item $dst).VersionInfo.FileVersion, (Get-FileHash $dst -Algorithm SHA256).Hash)
-              $lines += $line
-              Write-Host $line
-              if ((Test-Path $src) -and ((Get-FileHash $src -Algorithm SHA256).Hash -ne (Get-FileHash $dst -Algorithm SHA256).Hash)) {
-                throw "$n in the staged runtime does not match $src"
-              }
-            } else {
-              $lines += ("  {0,-24} MISSING FROM STAGE" -f $n)
-              throw "$n is missing from the staged runtime."
+            if (-not (Test-Path $dst)) {
+              $lines += ("  {0,-22} MISSING FROM STAGE (expected from {1})" -f $n, $e.Root)
+              throw "$n is missing from the staged runtime (expected from $($e.Root))."
+            }
+
+            $src = $null
+            foreach ($c in $e.Candidates) {
+              if (-not $c) { continue }
+              $probe = Join-Path $c $n
+              if (Test-Path $probe) { $src = $probe; break }
+            }
+            if (-not $src) {
+              throw "Could not locate the source of $n under $($e.Root) ($($e.RootPath)); the SHA256 comparison cannot be performed."
+            }
+
+            $srcHash = (Get-FileHash $src -Algorithm SHA256).Hash
+            $dstHash = (Get-FileHash $dst -Algorithm SHA256).Hash
+            $line = ("  {0,-22} source={1}  root={2}  version={3,-10} sha256={4}" -f $n, $src, $e.Root, (Get-Item $dst).VersionInfo.FileVersion, $dstHash)
+            $lines += $line
+            Write-Host $line
+            if ($srcHash -ne $dstHash) {
+              throw "Staged $n (sha256 $dstHash) does not match its source $src (sha256 $srcHash). The artifact would ship a file from a different installation."
             }
           }
+
+          $lines += ''
+          $lines += 'All runtime files verified against their single permitted source.'
           $lines | Out-File -FilePath openssl-inventory.txt -Encoding utf8
           Copy-Item openssl-inventory.txt -Destination $env:STAGE -Force
+          Write-Host ''
+          Write-Host 'source map and SHA256 verification PASSED'
 
       - name: Verify staged runtime
         shell: pwsh
