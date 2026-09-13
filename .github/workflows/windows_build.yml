@@ -18,6 +18,11 @@ on:
         required: false
         default: ''
         type: string
+      module_repository:
+        description: 'mod-playerbots repository (owner/repo). Default upstream; set a fork for a maintained commit.'
+        required: false
+        default: 'mod-playerbots/mod-playerbots'
+        type: string
       build_type:
         description: 'CTYPE passed to acore.sh (RelWithDebInfo | Release | Debug)'
         required: false
@@ -73,6 +78,10 @@ jobs:
       # ASP-maintenance: pin the module ref instead of deriving it from the core
       # branch. This project tracks the stable mod-playerbots master.
       MODULE_REF: ${{ inputs.module_ref != '' && inputs.module_ref || 'master' }}
+      # ASP-maintenance: the module's repository is selectable as well, so a maintained
+      # fork can be built by exact commit without editing this file. The default keeps
+      # the upstream repository, so ordinary builds behave exactly as before.
+      MODULE_REPOSITORY: ${{ inputs.module_repository || 'mod-playerbots/mod-playerbots' }}
       # ASP-maintenance: conf/dist/config.sh does CTYPE=${CTYPE:-Release}. Set it
       # explicitly so the build, the output folder and the provenance agree.
       CTYPE: ${{ inputs.build_type != '' && inputs.build_type || 'RelWithDebInfo' }}
@@ -88,7 +97,7 @@ jobs:
         id: module
         uses: actions/checkout@v7
         with:
-          repository: mod-playerbots/mod-playerbots
+          repository: ${{ env.MODULE_REPOSITORY }}
           ref: ${{ env.MODULE_REF }}
           path: modules/mod-playerbots
 
@@ -341,7 +350,7 @@ jobs:
             "core_commit          = $coreSha"
             "core_commit_date     = $(git log -1 --format=%cI)"
             "core_subject         = $(git log -1 --format=%s)"
-            "module_repository    = mod-playerbots/mod-playerbots"
+            "module_repository    = $env:MODULE_REPOSITORY"
             "module_ref           = $env:MODULE_REF"
             "module_commit        = $modSha"
             "module_commit_date   = $(git -C modules/mod-playerbots log -1 --format=%cI)"
